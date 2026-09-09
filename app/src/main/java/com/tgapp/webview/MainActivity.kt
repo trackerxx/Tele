@@ -1,4 +1,4 @@
-package com.telegramapp.webview
+package com.tgapp.webview
 
 import android.annotation.SuppressLint
 import android.graphics.Color
