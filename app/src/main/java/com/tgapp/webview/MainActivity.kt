@@ -9,7 +9,6 @@ import android.webkit.WebViewClient
 import android.webkit.CookieManager
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
-import android.content.res.Configuration
 
 class MainActivity : AppCompatActivity() {
 
@@ -49,17 +48,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun applyStatusBarColor() {
-        val isDarkMode = (resources.configuration.uiMode and
-            Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+        val barColor = Color.parseColor("#212121")
 
-        if (isDarkMode) {
-            window.statusBarColor = Color.parseColor("#17212B")
-            WindowCompat.getInsetsController(window, window.decorView)
-                .isAppearanceLightStatusBars = false
-        } else {
-            window.statusBarColor = Color.WHITE
-            WindowCompat.getInsetsController(window, window.decorView)
-                .isAppearanceLightStatusBars = true
+        window.statusBarColor = barColor
+        window.navigationBarColor = barColor
+
+        WindowCompat.getInsetsController(window, window.decorView).apply {
+            isAppearanceLightStatusBars = false
+            isAppearanceLightNavigationBars = false
         }
     }
 
