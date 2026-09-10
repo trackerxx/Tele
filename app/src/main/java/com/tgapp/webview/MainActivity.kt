@@ -202,25 +202,37 @@ class MainActivity : AppCompatActivity() {
                     e.preventDefault();
                     e.stopPropagation();
                     var fileName = a.getAttribute('download') || ('file_' + Date.now());
-                    fetch(href, { credentials: 'include' })
-                        .then(function(res) {
-                            if (!res.ok) { throw new Error('HTTP ' + res.status); }
-                            return res.blob();
-                        })
-                        .then(function(blob) {
-                            var reader = new FileReader();
-                            reader.onloadend = function() {
-                                var base64 = (reader.result || '').split(',')[1] || '';
-                                AndroidDownloader.saveBase64File(base64, fileName, blob.type || 'application/octet-stream');
-                            };
-                            reader.readAsDataURL(blob);
-                        })
-                        .catch(function(err) {
-                            // Same-click fetch is our best shot at a still-valid URL; if
-                            // it still fails (e.g. real cross-origin CORS block), hand the
-                            // URL to Android to try natively while it's still fresh.
-                            AndroidDownloader.fallbackNativeDownload(href, fileName, '');
-                        });
+
+                    if (href.indexOf('blob:') === 0) {
+                        // blob: URLs only resolve inside the page's own JS context, so
+                        // fetch() here is the only option.
+                        fetch(href, { credentials: 'include' })
+                            .then(function(res) {
+                                if (!res.ok) { throw new Error('HTTP ' + res.status); }
+                                return res.blob();
+                            })
+                            .then(function(blob) {
+                                var reader = new FileReader();
+                                reader.onloadend = function() {
+                                    var base64 = (reader.result || '').split(',')[1] || '';
+                                    AndroidDownloader.saveBase64File(base64, fileName, blob.type || 'application/octet-stream');
+                                };
+                                reader.readAsDataURL(blob);
+                            })
+                            .catch(function(err) {
+                                AndroidDownloader.reportError(err && err.message ? err.message : String(err));
+                            });
+                        return;
+                    }
+
+                    // Regular http(s) URLs are signed with a short-lived, single-use
+                    // token AND are cross-origin (CORS will block reading the response
+                    // here anyway). Doing a JS fetch() first would burn that token on a
+                    // request whose result we can't even use, leaving the native retry
+                    // to hit an already-expired URL (the "Redirect with no Location
+                    // header" failure). So for non-blob links, skip straight to the
+                    // native downloader — it becomes the first and only request.
+                    AndroidDownloader.fallbackNativeDownload(href, fileName, '');
                 }, true);
             })();
         """.trimIndent()
