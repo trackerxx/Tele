@@ -13,6 +13,7 @@ import android.os.Environment
 import android.webkit.CookieManager
 import android.webkit.URLUtil
 import android.webkit.ValueCallback
+import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
@@ -97,6 +98,26 @@ class MainActivity : AppCompatActivity() {
                 fileChooserLauncher.launch(Intent.createChooser(intent, "Select file"))
                 return true
             }
+
+            // Grants mic (and camera, if requested) access for voice messages / calls,
+            // as long as the matching Android runtime permission has already been granted.
+            override fun onPermissionRequest(request: PermissionRequest?) {
+                request ?: return
+                val granted = request.resources.filter { resource ->
+                    when (resource) {
+                        PermissionRequest.RESOURCE_AUDIO_CAPTURE ->
+                            checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+                        PermissionRequest.RESOURCE_VIDEO_CAPTURE ->
+                            checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+                        else -> false
+                    }
+                }
+                if (granted.isNotEmpty()) {
+                    request.grant(granted.toTypedArray())
+                } else {
+                    request.deny()
+                }
+            }
         }
 
         // Handles files that Telegram Web pushes out for download (media, documents, etc.)
@@ -141,6 +162,7 @@ class MainActivity : AppCompatActivity() {
                 needed += Manifest.permission.WRITE_EXTERNAL_STORAGE
             }
         }
+        needed += Manifest.permission.RECORD_AUDIO
 
         val notGranted = needed.filter {
             checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
