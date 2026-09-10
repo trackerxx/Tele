@@ -358,6 +358,7 @@ class MainActivity : AppCompatActivity() {
                         Handler(Looper.getMainLooper()).postDelayed({
                             reportDownloadOutcome(downloadId, attempt + 1)
                         }, 8000)
+                        Unit
                     } else {
                         val statusText = if (status == DownloadManager.STATUS_RUNNING)
                             "still running" else "still pending (not started yet)"
@@ -370,6 +371,7 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
                 }
+                else -> Unit
             }
         }
     }
