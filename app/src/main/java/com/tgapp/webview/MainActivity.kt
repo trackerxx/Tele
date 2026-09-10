@@ -3,15 +3,20 @@ package com.tgapp.webview
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.DownloadManager
+import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.media.AudioManager
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.provider.MediaStore
+import android.util.Base64
 import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
 import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.PermissionRequest
@@ -24,6 +29,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.getSystemService
 import androidx.core.view.WindowCompat
+import java.io.File
+import java.io.FileOutputStream
 
 class MainActivity : AppCompatActivity() {
 
@@ -83,6 +90,11 @@ class MainActivity : AppCompatActivity() {
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
 
+        // Lets JS inside the page hand real (non-blob) bytes back to Android for saving.
+        // Needed because web.telegram.org/k/ serves media/file downloads as blob: URLs,
+        // which DownloadManager cannot fetch on its own.
+        webView.addJavascriptInterface(BlobDownloadInterface(), "AndroidDownloader")
+
         webView.webViewClient = WebViewClient()
 
         // Lets the "attach file" button inside web.telegram.org open the system file picker
@@ -127,8 +139,19 @@ class MainActivity : AppCompatActivity() {
 
         // Handles files that Telegram Web pushes out for download (media, documents, etc.)
         webView.setDownloadListener { url, _, contentDisposition, mimeType, _ ->
+            val fileName = URLUtil.guessFileName(url, contentDisposition, mimeType)
+
+            if (url.startsWith("blob:")) {
+                // web.telegram.org/k/ hands most media/document downloads to us as blob:
+                // URLs. DownloadManager can't fetch that scheme (no network request behind
+                // it), so instead we read the blob's bytes from inside the page via JS and
+                // send them to Android as base64 to be written straight to disk.
+                fetchBlobAsBase64(url, fileName, mimeType)
+                Toast.makeText(this, "Preparing download: $fileName", Toast.LENGTH_SHORT).show()
+                return@setDownloadListener
+            }
+
             try {
-                val fileName = URLUtil.guessFileName(url, contentDisposition, mimeType)
                 val cookie = CookieManager.getInstance().getCookie(url) ?: ""
 
                 val request = DownloadManager.Request(Uri.parse(url)).apply {
@@ -149,6 +172,89 @@ class MainActivity : AppCompatActivity() {
             webView.restoreState(savedInstanceState)
         } else {
             webView.loadUrl("https://web.telegram.org/k/")
+        }
+    }
+
+    /**
+     * Runs JS inside the page to read a blob: URL's actual bytes and hand them back to
+     * Android (as base64) via BlobDownloadInterface, since DownloadManager can't fetch
+     * blob: URLs itself.
+     */
+    private fun fetchBlobAsBase64(blobUrl: String, fileName: String, mimeType: String) {
+        val safeFileName = fileName.replace("\\", "\\\\").replace("\"", "\\\"")
+        val safeMimeType = (mimeType.ifBlank { "application/octet-stream" })
+            .replace("\\", "\\\\").replace("\"", "\\\"")
+
+        val js = """
+            (function() {
+                fetch("$blobUrl")
+                    .then(function(res) { return res.blob(); })
+                    .then(function(blob) {
+                        var reader = new FileReader();
+                        reader.onloadend = function() {
+                            var base64 = reader.result.split(',')[1] || '';
+                            AndroidDownloader.saveBase64File(base64, "$safeFileName", "$safeMimeType");
+                        };
+                        reader.readAsDataURL(blob);
+                    })
+                    .catch(function(e) {
+                        AndroidDownloader.reportError(e && e.message ? e.message : String(e));
+                    });
+            })();
+        """.trimIndent()
+
+        webView.evaluateJavascript(js, null)
+    }
+
+    /** Writes decoded bytes into the public Downloads collection (scoped-storage safe). */
+    private fun saveBytesToDownloads(bytes: ByteArray, fileName: String, mimeType: String) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val resolver = contentResolver
+            val values = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                put(MediaStore.Downloads.MIME_TYPE, mimeType)
+                put(MediaStore.Downloads.IS_PENDING, 1)
+            }
+            val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                ?: throw IllegalStateException("Could not create entry in Downloads")
+
+            resolver.openOutputStream(uri)?.use { it.write(bytes) }
+                ?: throw IllegalStateException("Could not open output stream")
+
+            values.clear()
+            values.put(MediaStore.Downloads.IS_PENDING, 0)
+            resolver.update(uri, values, null, null)
+        } else {
+            val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            if (!downloadsDir.exists()) downloadsDir.mkdirs()
+            val file = File(downloadsDir, fileName)
+            FileOutputStream(file).use { it.write(bytes) }
+            // Pre-Q, files written directly to disk need a media-scan nudge to show up
+            // immediately in file managers / gallery apps.
+            MediaScannerConnection.scanFile(this, arrayOf(file.absolutePath), arrayOf(mimeType), null)
+        }
+    }
+
+    /** JS-facing bridge: receives a blob's bytes as base64 and saves them as a real file. */
+    private inner class BlobDownloadInterface {
+        @JavascriptInterface
+        fun saveBase64File(base64Data: String, fileName: String, mimeType: String) {
+            runOnUiThread {
+                try {
+                    val bytes = Base64.decode(base64Data, Base64.DEFAULT)
+                    saveBytesToDownloads(bytes, fileName, mimeType)
+                    Toast.makeText(this@MainActivity, "Saved to Downloads: $fileName", Toast.LENGTH_SHORT).show()
+                } catch (e: Exception) {
+                    Toast.makeText(this@MainActivity, "Save failed: ${e.message}", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun reportError(message: String) {
+            runOnUiThread {
+                Toast.makeText(this@MainActivity, "Download failed: $message", Toast.LENGTH_SHORT).show()
+            }
         }
     }
 
