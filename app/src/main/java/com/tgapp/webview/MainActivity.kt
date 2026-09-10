@@ -160,7 +160,6 @@ class MainActivity : AppCompatActivity() {
             needed += Manifest.permission.READ_MEDIA_IMAGES
             needed += Manifest.permission.READ_MEDIA_VIDEO
             needed += Manifest.permission.READ_MEDIA_AUDIO
-            needed += Manifest.permission.POST_NOTIFICATIONS
         } else {
             needed += Manifest.permission.READ_EXTERNAL_STORAGE
             if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
