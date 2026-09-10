@@ -6,6 +6,7 @@ import android.app.DownloadManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -73,6 +74,10 @@ class MainActivity : AppCompatActivity() {
         settings.displayZoomControls = false
         settings.cacheMode = WebSettings.LOAD_DEFAULT
         settings.allowFileAccess = true
+        settings.mediaPlaybackRequiresUserGesture = false
+
+        // Some devices need audio mode explicitly reset to NORMAL for WebView mic capture to work
+        (getSystemService(AUDIO_SERVICE) as? AudioManager)?.mode = AudioManager.MODE_NORMAL
 
         // Keep login sessions saved
         CookieManager.getInstance().setAcceptCookie(true)
@@ -113,9 +118,9 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 if (granted.isNotEmpty()) {
-                    request.grant(granted.toTypedArray())
+                    runOnUiThread { request.grant(granted.toTypedArray()) }
                 } else {
-                    request.deny()
+                    runOnUiThread { request.deny() }
                 }
             }
         }
