@@ -3,9 +3,13 @@ package com.tgapp.webview
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.DownloadManager
+import android.content.BroadcastReceiver
 import android.content.ContentValues
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.database.Cursor
 import android.graphics.Color
 import android.media.AudioManager
 import android.media.MediaScannerConnection
@@ -95,6 +99,24 @@ class MainActivity : AppCompatActivity() {
         // resolve correctly from inside the page's own session/service-worker context.
         webView.addJavascriptInterface(BlobDownloadInterface(), "AndroidDownloader")
 
+        // Reports the REAL reason a DownloadManager download failed (HTTP code, etc.)
+        // instead of us guessing — the system-drawn "Untitled" notification that
+        // disappears quickly doesn't say why, so we ask DownloadManager directly.
+        val downloadReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                val id = intent?.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1) ?: -1
+                if (id == -1L) return
+                reportDownloadOutcome(id)
+            }
+        }
+        val filter = IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(downloadReceiver, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(downloadReceiver, filter)
+        }
+
         webView.webViewClient = WebViewClient()
 
         // Lets the "attach file" button inside web.telegram.org open the system file picker
@@ -169,6 +191,7 @@ class MainActivity : AppCompatActivity() {
                     addRequestHeader("cookie", cookie)
                     addRequestHeader("User-Agent", userAgent)
                     addRequestHeader("Referer", referer)
+                    setTitle(fileName)
                     setMimeType(mimeType)
                     setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
                     setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
@@ -185,6 +208,42 @@ class MainActivity : AppCompatActivity() {
             webView.restoreState(savedInstanceState)
         } else {
             webView.loadUrl("https://web.telegram.org/k/")
+        }
+    }
+
+    /**
+     * Queries DownloadManager for what actually happened to a finished download and
+     * shows the real reason (HTTP status code, or the internal ERROR_* reason) instead
+     * of leaving it as an unexplained "Untitled" notification that vanishes.
+     */
+    private fun reportDownloadOutcome(downloadId: Long) {
+        val dm = getSystemService<DownloadManager>() ?: return
+        val cursor: Cursor = dm.query(DownloadManager.Query().setFilterById(downloadId)) ?: return
+        cursor.use {
+            if (!it.moveToFirst()) return
+            val status = it.getInt(it.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+            val reason = it.getInt(it.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON))
+            val title = it.getString(it.getColumnIndexOrThrow(DownloadManager.COLUMN_TITLE)) ?: "file"
+
+            when (status) {
+                DownloadManager.STATUS_SUCCESSFUL -> {
+                    Toast.makeText(this, "Saved: $title", Toast.LENGTH_SHORT).show()
+                }
+                DownloadManager.STATUS_FAILED -> {
+                    val reasonText = when (reason) {
+                        DownloadManager.ERROR_HTTP_DATA_ERROR -> "HTTP data error"
+                        DownloadManager.ERROR_UNHANDLED_HTTP_CODE -> "HTTP error"
+                        DownloadManager.ERROR_CANNOT_RESUME -> "cannot resume"
+                        DownloadManager.ERROR_DEVICE_NOT_FOUND -> "storage not found"
+                        DownloadManager.ERROR_FILE_ALREADY_EXISTS -> "file already exists"
+                        DownloadManager.ERROR_FILE_ERROR -> "file error"
+                        DownloadManager.ERROR_INSUFFICIENT_SPACE -> "insufficient space"
+                        DownloadManager.ERROR_TOO_MANY_REDIRECTS -> "too many redirects"
+                        else -> "code $reason (often an HTTP status like 403/404 in the 400+ range)"
+                    }
+                    Toast.makeText(this, "Download failed for $title: $reasonText", Toast.LENGTH_LONG).show()
+                }
+            }
         }
     }
 
