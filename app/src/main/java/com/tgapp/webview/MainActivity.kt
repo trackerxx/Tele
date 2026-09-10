@@ -104,6 +104,42 @@ class MainActivity : AppCompatActivity() {
                 super.onPageFinished(view, url)
                 injectDownloadClickInterceptor()
             }
+
+            // Catches navigations that reach WebView WITHOUT going through our JS click
+            // interceptor at all — e.g. a plain <a href="..."> (no "download" attribute)
+            // or a `location.href = url` assignment. Without this override, WebView's
+            // own Chromium engine performs the first request itself to inspect the
+            // response (Content-Disposition etc.) before ever calling
+            // setDownloadListener — silently burning the single-use signed token. Our
+            // setDownloadListener call then re-requests the same (now-dead) URL and
+            // gets a 302 with no Location header.
+            //
+            // By intercepting here, BEFORE WebView issues any request, our own
+            // downloadHttpFile() call becomes the first and only request for the URL.
+            override fun shouldOverrideUrlLoading(
+                view: WebView?,
+                request: android.webkit.WebResourceRequest?
+            ): Boolean {
+                val uri = request?.url ?: return false
+                val url = uri.toString()
+
+                // Real in-app navigation (Telegram's own domain) — let WebView handle it.
+                if (uri.host == "web.telegram.org") return false
+                // Non-http(s) schemes (tel:, mailto:, intent:, etc.) — let the system handle it.
+                if (uri.scheme != "http" && uri.scheme != "https") return false
+
+                // Anything else is treated as a file/CDN link: fetch it ourselves as the
+                // very first request, never letting WebView touch it.
+                val fileName = URLUtil.guessFileName(url, null, null)
+                val cookie = CookieManager.getInstance().getCookie(url) ?: ""
+                val referer = webView.url ?: "https://web.telegram.org/k/"
+                val userAgent = webView.settings.userAgentString
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "Downloading $fileName", Toast.LENGTH_SHORT).show()
+                }
+                downloadHttpFile(url, fileName, "", cookie, referer, userAgent)
+                return true
+            }
         }
 
         // Lets the "attach file" button inside web.telegram.org open the system file picker
@@ -144,13 +180,61 @@ class MainActivity : AppCompatActivity() {
                     runOnUiThread { request.deny() }
                 }
             }
+
+            // Handles window.open(url) / <a target="_blank"> downloads. Without this,
+            // such requests either get silently dropped or, worse, get fetched by a new
+            // WebView instance first (again burning the single-use token before we ever
+            // see the URL). We spin up a throwaway, invisible WebView purely to read the
+            // target URL from its own shouldOverrideUrlLoading callback — cancelling that
+            // load immediately so IT never makes a request either — then route the URL
+            // through our normal native downloader as the first and only real request.
+            override fun onCreateWindow(
+                view: WebView?,
+                isDialog: Boolean,
+                isUserGesture: Boolean,
+                resultMsg: android.os.Message?
+            ): Boolean {
+                val tempWebView = WebView(this@MainActivity)
+                tempWebView.webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(
+                        v: WebView?,
+                        request: android.webkit.WebResourceRequest?
+                    ): Boolean {
+                        val uri = request?.url
+                        if (uri != null && (uri.scheme == "http" || uri.scheme == "https")) {
+                            val url = uri.toString()
+                            val fileName = URLUtil.guessFileName(url, null, null)
+                            val cookie = CookieManager.getInstance().getCookie(url) ?: ""
+                            val referer = webView.url ?: "https://web.telegram.org/k/"
+                            val userAgent = webView.settings.userAgentString
+                            runOnUiThread {
+                                Toast.makeText(this@MainActivity, "Downloading $fileName", Toast.LENGTH_SHORT).show()
+                            }
+                            downloadHttpFile(url, fileName, "", cookie, referer, userAgent)
+                        }
+                        tempWebView.destroy()
+                        return true // never let the temp WebView actually load anything
+                    }
+                }
+                val transport = resultMsg?.obj as? WebView.WebViewTransport
+                transport?.webView = tempWebView
+                resultMsg?.sendToTarget()
+                return true
+            }
         }
 
-        // Secondary path: injectDownloadClickInterceptor() (below) handles the normal
-        // case by catching the click on Telegram's own <a download> link before any
-        // navigation happens. This listener only fires for downloads that reach WebView
-        // as an actual navigation (no JS-clickable anchor involved) — rarer, but still
-        // handled the same way: blob: via JS, everything else via the native downloader.
+        // Also enable multi-window support so onCreateWindow above actually gets called
+        // for window.open() / target="_blank" instead of being silently dropped.
+        webView.settings.setSupportMultipleWindows(true)
+        webView.settings.javaScriptCanOpenWindowsAutomatically = true
+
+        // Last-resort safety net only. In the normal flow, downloads are now caught
+        // BEFORE WebView ever makes its own request — either by the JS click
+        // interceptor (injectDownloadClickInterceptor, for <a download> clicks),
+        // shouldOverrideUrlLoading (for plain navigations), or onCreateWindow (for
+        // window.open() / target="_blank"). This listener should only fire for edge
+        // cases none of those catch — e.g. a same-origin (web.telegram.org) URL that
+        // still turns out to be a download.
         webView.setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
             val fileName = URLUtil.guessFileName(url, contentDisposition, mimeType)
 
