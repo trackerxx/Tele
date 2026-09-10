@@ -15,6 +15,7 @@ import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
 import android.util.Base64
+import android.util.Log
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.URLUtil
@@ -37,6 +38,10 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 class MainActivity : AppCompatActivity() {
+
+    companion object {
+        private const val TAG = "TgDownload"
+    }
 
     private lateinit var webView: WebView
 
@@ -137,7 +142,7 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread {
                     Toast.makeText(this@MainActivity, "Downloading $fileName", Toast.LENGTH_SHORT).show()
                 }
-                downloadHttpFile(url, fileName, "", cookie, referer, userAgent)
+                downloadHttpFile(url, fileName, "", cookie, referer, userAgent, source = "shouldOverrideUrlLoading")
                 return true
             }
         }
@@ -210,7 +215,7 @@ class MainActivity : AppCompatActivity() {
                             runOnUiThread {
                                 Toast.makeText(this@MainActivity, "Downloading $fileName", Toast.LENGTH_SHORT).show()
                             }
-                            downloadHttpFile(url, fileName, "", cookie, referer, userAgent)
+                            downloadHttpFile(url, fileName, "", cookie, referer, userAgent, source = "onCreateWindow")
                         }
                         tempWebView.destroy()
                         return true // never let the temp WebView actually load anything
@@ -219,6 +224,15 @@ class MainActivity : AppCompatActivity() {
                 val transport = resultMsg?.obj as? WebView.WebViewTransport
                 transport?.webView = tempWebView
                 resultMsg?.sendToTarget()
+                return true
+            }
+
+            // Forwards page console.log/warn/error output to Logcat under TAG, so the
+            // click interceptor's own logging (added below) is visible while debugging.
+            override fun onConsoleMessage(consoleMessage: android.webkit.ConsoleMessage?): Boolean {
+                consoleMessage ?: return false
+                Log.d(TAG, "console: ${consoleMessage.message()} " +
+                    "(${consoleMessage.sourceId()}:${consoleMessage.lineNumber()})")
                 return true
             }
         }
@@ -247,7 +261,7 @@ class MainActivity : AppCompatActivity() {
             val cookie = CookieManager.getInstance().getCookie(url) ?: ""
             val referer = webView.url ?: "https://web.telegram.org/k/"
             Toast.makeText(this, "Downloading $fileName", Toast.LENGTH_SHORT).show()
-            downloadHttpFile(url, fileName, mimeType, cookie, referer, userAgent)
+            downloadHttpFile(url, fileName, mimeType, cookie, referer, userAgent, source = "setDownloadListener")
         }
 
         if (savedInstanceState != null) {
@@ -280,9 +294,16 @@ class MainActivity : AppCompatActivity() {
                 window.__androidDownloadInterceptorInstalled = true;
                 document.addEventListener('click', function(e) {
                     var a = e.target && e.target.closest ? e.target.closest('a[download]') : null;
-                    if (!a) return;
+                    if (!a) {
+                        console.log('[dl-debug] click on', e.target && e.target.tagName, '- no a[download] ancestor found');
+                        return;
+                    }
                     var href = a.getAttribute('href');
-                    if (!href) return;
+                    if (!href) {
+                        console.log('[dl-debug] a[download] found but no href attribute');
+                        return;
+                    }
+                    console.log('[dl-debug] intercepted a[download] click, href=', href);
                     e.preventDefault();
                     e.stopPropagation();
                     var fileName = a.getAttribute('download') || ('file_' + Date.now());
@@ -373,8 +394,12 @@ class MainActivity : AppCompatActivity() {
         mimeType: String,
         cookie: String,
         referer: String,
-        userAgent: String
+        userAgent: String,
+        source: String = "unknown"
     ) {
+        Log.d(TAG, "downloadHttpFile START source=$source url=$startUrl file=$fileName " +
+            "cookiePresent=${cookie.isNotBlank()} referer=$referer ua=$userAgent")
+
         Thread {
             var connection: HttpURLConnection? = null
             try {
@@ -393,10 +418,21 @@ class MainActivity : AppCompatActivity() {
                     conn.connect()
                     val code = conn.responseCode
 
+                    // Dump every response header we got back on this hop — useful for
+                    // spotting a differently-cased "location" header, or anti-bot
+                    // signals (cf-mitigated, server, etc.) that explain a missing
+                    // Location on a 3xx.
+                    val headerDump = conn.headerFields.entries.joinToString("; ") { (k, v) ->
+                        "${k ?: "status"}=${v.joinToString(",")}"
+                    }
+                    Log.d(TAG, "hop=$redirects url=$currentUrl code=$code headers=[$headerDump]")
+
                     if (code in 300..399) {
                         val location = conn.getHeaderField("Location")
                         conn.disconnect()
                         if (location.isNullOrBlank()) {
+                            Log.w(TAG, "downloadHttpFile FAIL source=$source: redirect with no Location, " +
+                                "last url=$currentUrl code=$code")
                             throw IOException("Redirect with no Location header (HTTP $code)")
                         }
                         currentUrl = URL(URL(currentUrl), location).toString()
@@ -406,6 +442,7 @@ class MainActivity : AppCompatActivity() {
 
                     if (code !in 200..299) {
                         conn.disconnect()
+                        Log.w(TAG, "downloadHttpFile FAIL source=$source: HTTP $code at url=$currentUrl")
                         throw IOException("HTTP $code")
                     }
 
@@ -424,10 +461,12 @@ class MainActivity : AppCompatActivity() {
                     saveStreamToDownloads(input, fileName, actualMime)
                 }
 
+                Log.d(TAG, "downloadHttpFile SUCCESS source=$source file=$fileName")
                 runOnUiThread {
                     Toast.makeText(this, "Saved to Downloads: $fileName", Toast.LENGTH_SHORT).show()
                 }
             } catch (e: Exception) {
+                Log.e(TAG, "downloadHttpFile EXCEPTION source=$source file=$fileName", e)
                 runOnUiThread {
                     AlertDialog.Builder(this)
                         .setTitle("Download failed")
@@ -515,7 +554,7 @@ class MainActivity : AppCompatActivity() {
                 val referer = webView.url ?: "https://web.telegram.org/k/"
                 val userAgent = webView.settings.userAgentString
                 Toast.makeText(this@MainActivity, "Downloading $fileName", Toast.LENGTH_SHORT).show()
-                downloadHttpFile(url, fileName, mimeType.ifBlank { "application/octet-stream" }, cookie, referer, userAgent)
+                downloadHttpFile(url, fileName, mimeType.ifBlank { "application/octet-stream" }, cookie, referer, userAgent, source = "fallbackNativeDownload")
             }
         }
     }
