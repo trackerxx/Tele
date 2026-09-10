@@ -227,7 +227,7 @@ class MainActivity : AppCompatActivity() {
 
             when (status) {
                 DownloadManager.STATUS_SUCCESSFUL -> {
-                    val sizeBytes = it.getLong(it.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE))
+                    val sizeBytes = it.getLong(it.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES))
                     val localUri = it.getString(it.getColumnIndexOrThrow(DownloadManager.COLUMN_LOCAL_URI))
                     Toast.makeText(
                         this,
