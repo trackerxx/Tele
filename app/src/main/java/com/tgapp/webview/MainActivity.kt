@@ -2,6 +2,7 @@ package com.tgapp.webview
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.AlertDialog
 import android.app.DownloadManager
 import android.content.BroadcastReceiver
 import android.content.ContentValues
@@ -17,6 +18,8 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.provider.MediaStore
 import android.util.Base64
 import android.webkit.CookieManager
@@ -117,7 +120,12 @@ class MainActivity : AppCompatActivity() {
             registerReceiver(downloadReceiver, filter)
         }
 
-        webView.webViewClient = WebViewClient()
+        webView.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView?, url: String?) {
+                super.onPageFinished(view, url)
+                injectBlobClickInterceptor()
+            }
+        }
 
         // Lets the "attach file" button inside web.telegram.org open the system file picker
         webView.webChromeClient = object : WebChromeClient() {
@@ -197,8 +205,18 @@ class MainActivity : AppCompatActivity() {
                     setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
                 }
 
-                getSystemService<DownloadManager>()?.enqueue(request)
+                val id = getSystemService<DownloadManager>()?.enqueue(request)
                 Toast.makeText(this, "Downloading $fileName", Toast.LENGTH_SHORT).show()
+
+                // Fail-safe: some devices/ROMs don't reliably deliver
+                // ACTION_DOWNLOAD_COMPLETE to app-registered receivers. Check the
+                // status directly after a delay so we get the diagnostic dialog
+                // regardless.
+                if (id != null) {
+                    Handler(Looper.getMainLooper()).postDelayed({
+                        reportDownloadOutcome(id)
+                    }, 8000)
+                }
             } catch (e: Exception) {
                 Toast.makeText(this, "Download failed: ${e.message}", Toast.LENGTH_SHORT).show()
             }
@@ -209,6 +227,47 @@ class MainActivity : AppCompatActivity() {
         } else {
             webView.loadUrl("https://web.telegram.org/k/")
         }
+    }
+
+    /**
+     * Installs a capturing click listener (once per page load) that intercepts clicks on
+     * download links (<a download href="blob:...">) at the instant they happen — BEFORE
+     * Telegram's own JS gets a chance to revoke the blob URL a moment later. This is the
+     * real fix for blob downloads: relying on WebView's setDownloadListener is too late,
+     * since it fires after a delay and the blob is often already gone by then (causing
+     * "Failed to fetch"). We preventDefault() the click and read the blob ourselves,
+     * immediately, in the same event.
+     */
+    private fun injectBlobClickInterceptor() {
+        val js = """
+            (function() {
+                if (window.__androidBlobInterceptorInstalled) return;
+                window.__androidBlobInterceptorInstalled = true;
+                document.addEventListener('click', function(e) {
+                    var a = e.target && e.target.closest ? e.target.closest('a[download]') : null;
+                    if (!a) return;
+                    var href = a.getAttribute('href');
+                    if (!href || href.indexOf('blob:') !== 0) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    var fileName = a.getAttribute('download') || ('file_' + Date.now());
+                    fetch(href)
+                        .then(function(res) { return res.blob(); })
+                        .then(function(blob) {
+                            var reader = new FileReader();
+                            reader.onloadend = function() {
+                                var base64 = (reader.result || '').split(',')[1] || '';
+                                AndroidDownloader.saveBase64File(base64, fileName, blob.type || 'application/octet-stream');
+                            };
+                            reader.readAsDataURL(blob);
+                        })
+                        .catch(function(err) {
+                            AndroidDownloader.reportError(err && err.message ? err.message : String(err));
+                        });
+                }, true);
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(js, null)
     }
 
     /**
@@ -229,11 +288,13 @@ class MainActivity : AppCompatActivity() {
                 DownloadManager.STATUS_SUCCESSFUL -> {
                     val sizeBytes = it.getLong(it.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES))
                     val localUri = it.getString(it.getColumnIndexOrThrow(DownloadManager.COLUMN_LOCAL_URI))
-                    Toast.makeText(
-                        this,
-                        "Saved: $title (${sizeBytes} bytes)\n$localUri",
-                        Toast.LENGTH_LONG
-                    ).show()
+                    runOnUiThread {
+                        AlertDialog.Builder(this)
+                            .setTitle("Download finished")
+                            .setMessage("File: $title\nSize: $sizeBytes bytes\nSaved at: $localUri")
+                            .setPositiveButton("OK", null)
+                            .show()
+                    }
                 }
                 DownloadManager.STATUS_FAILED -> {
                     val reasonText = when (reason) {
@@ -247,7 +308,27 @@ class MainActivity : AppCompatActivity() {
                         DownloadManager.ERROR_TOO_MANY_REDIRECTS -> "too many redirects"
                         else -> "code $reason (often an HTTP status like 403/404 in the 400+ range)"
                     }
-                    Toast.makeText(this, "Download failed for $title: $reasonText", Toast.LENGTH_LONG).show()
+                    runOnUiThread {
+                        AlertDialog.Builder(this)
+                            .setTitle("Download failed")
+                            .setMessage("File: $title\nReason: $reasonText")
+                            .setPositiveButton("OK", null)
+                            .show()
+                    }
+                }
+                DownloadManager.STATUS_RUNNING, DownloadManager.STATUS_PENDING, DownloadManager.STATUS_PAUSED -> {
+                    val statusText = when (status) {
+                        DownloadManager.STATUS_RUNNING -> "still running"
+                        DownloadManager.STATUS_PENDING -> "still pending (not started yet)"
+                        else -> "paused"
+                    }
+                    runOnUiThread {
+                        AlertDialog.Builder(this)
+                            .setTitle("Download stuck")
+                            .setMessage("File: $title\nStatus: $statusText (8s after starting)")
+                            .setPositiveButton("OK", null)
+                            .show()
+                    }
                 }
             }
         }
