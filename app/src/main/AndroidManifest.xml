@@ -14,6 +14,9 @@
     <!-- Android 13+ requires this to show the "download complete" notification -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- Needed for voice messages / calls (getUserMedia mic access) inside the WebView -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
     <application
         android:allowBackup="true"
         android:label="@string/app_name"
