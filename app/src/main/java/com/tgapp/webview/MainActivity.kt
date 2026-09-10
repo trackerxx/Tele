@@ -102,7 +102,7 @@ class MainActivity : AppCompatActivity() {
         webView.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
-                injectBlobClickInterceptor()
+                injectDownloadClickInterceptor()
             }
         }
 
@@ -146,21 +146,11 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Handles files that Telegram Web pushes out for download (media, documents, etc.)
-        //
-        // Two different mechanisms are needed depending on the URL scheme:
-        // - blob: URLs (in-memory objects created by the page's own JS) have no real
-        //   network request behind them, so we read their bytes from inside the page via
-        //   JS and hand them to Android as base64.
-        // - Regular http(s) URLs are downloaded by Android directly using a plain
-        //   HttpURLConnection (see downloadHttpFile), NOT DownloadManager and NOT the
-        //   page's JS fetch(). Both of those were tried and both fail on Telegram's CDN:
-        //   DownloadManager silently drops our Cookie/Referer headers whenever the URL
-        //   redirects (common with signed CDN links), and JS fetch() gets blocked by the
-        //   browser's CORS policy on the cross-origin CDN domain ("Failed to fetch").
-        //   A raw HttpURLConnection has neither limitation: it isn't a browser context so
-        //   CORS doesn't apply, and we follow redirects ourselves, re-attaching the same
-        //   headers on every hop.
+        // Secondary path: injectDownloadClickInterceptor() (below) handles the normal
+        // case by catching the click on Telegram's own <a download> link before any
+        // navigation happens. This listener only fires for downloads that reach WebView
+        // as an actual navigation (no JS-clickable anchor involved) — rarer, but still
+        // handled the same way: blob: via JS, everything else via the native downloader.
         webView.setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
             val fileName = URLUtil.guessFileName(url, contentDisposition, mimeType)
 
@@ -185,28 +175,38 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * Installs a capturing click listener (once per page load) that intercepts clicks on
-     * download links (<a download href="blob:...">) at the instant they happen — BEFORE
-     * Telegram's own JS gets a chance to revoke the blob URL a moment later. This is the
-     * real fix for blob downloads: relying on WebView's setDownloadListener is too late,
-     * since it fires after a delay and the blob is often already gone by then (causing
-     * "Failed to fetch"). We preventDefault() the click and read the blob ourselves,
-     * immediately, in the same event.
+     * download links (<a download href="...">) at the instant they happen, for BOTH
+     * blob: and regular http(s) URLs.
+     *
+     * This turned out to be the real fix for the "Download failed" / "HTTP 302 no
+     * Location" / "Failed to fetch" errors we kept seeing for regular URLs too: Telegram
+     * signs these download links with a short-lived / single-use token. Letting the click
+     * navigate normally means WebView makes its own (silent, first) request to that URL
+     * before ever calling setDownloadListener — by the time our code got the URL from
+     * that callback and tried to fetch it again ourselves, the token had already been
+     * used up, so every retry we tried (DownloadManager, JS fetch, native HttpURLConnection)
+     * kept failing in different ways. Fetching it ourselves at the moment of the click,
+     * before any navigation happens, means we're always the FIRST and ONLY request for
+     * that URL, using it while it's still valid.
      */
-    private fun injectBlobClickInterceptor() {
+    private fun injectDownloadClickInterceptor() {
         val js = """
             (function() {
-                if (window.__androidBlobInterceptorInstalled) return;
-                window.__androidBlobInterceptorInstalled = true;
+                if (window.__androidDownloadInterceptorInstalled) return;
+                window.__androidDownloadInterceptorInstalled = true;
                 document.addEventListener('click', function(e) {
                     var a = e.target && e.target.closest ? e.target.closest('a[download]') : null;
                     if (!a) return;
                     var href = a.getAttribute('href');
-                    if (!href || href.indexOf('blob:') !== 0) return;
+                    if (!href) return;
                     e.preventDefault();
                     e.stopPropagation();
                     var fileName = a.getAttribute('download') || ('file_' + Date.now());
-                    fetch(href)
-                        .then(function(res) { return res.blob(); })
+                    fetch(href, { credentials: 'include' })
+                        .then(function(res) {
+                            if (!res.ok) { throw new Error('HTTP ' + res.status); }
+                            return res.blob();
+                        })
                         .then(function(blob) {
                             var reader = new FileReader();
                             reader.onloadend = function() {
@@ -216,7 +216,10 @@ class MainActivity : AppCompatActivity() {
                             reader.readAsDataURL(blob);
                         })
                         .catch(function(err) {
-                            AndroidDownloader.reportError(err && err.message ? err.message : String(err));
+                            // Same-click fetch is our best shot at a still-valid URL; if
+                            // it still fails (e.g. real cross-origin CORS block), hand the
+                            // URL to Android to try natively while it's still fresh.
+                            AndroidDownloader.fallbackNativeDownload(href, fileName, '');
                         });
                 }, true);
             })();
@@ -395,6 +398,28 @@ class MainActivity : AppCompatActivity() {
         fun reportError(message: String) {
             runOnUiThread {
                 Toast.makeText(this@MainActivity, "Download failed: $message", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        /**
+         * Called when the page's own click-time fetch() fails (e.g. a genuine
+         * cross-origin CORS block). The URL is still fresh at this point — the click
+         * handler hasn't let WebView navigate anywhere yet — so it's worth one native
+         * HttpURLConnection attempt, which isn't subject to browser CORS rules at all.
+         */
+        @JavascriptInterface
+        fun fallbackNativeDownload(url: String, fileName: String, mimeType: String) {
+            runOnUiThread {
+                if (url.startsWith("blob:")) {
+                    // No real network request behind a blob: URL — nothing more to try.
+                    Toast.makeText(this@MainActivity, "Download failed: $fileName", Toast.LENGTH_SHORT).show()
+                    return@runOnUiThread
+                }
+                val cookie = CookieManager.getInstance().getCookie(url) ?: ""
+                val referer = webView.url ?: "https://web.telegram.org/k/"
+                val userAgent = webView.settings.userAgentString
+                Toast.makeText(this@MainActivity, "Downloading $fileName", Toast.LENGTH_SHORT).show()
+                downloadHttpFile(url, fileName, mimeType.ifBlank { "application/octet-stream" }, cookie, referer, userAgent)
             }
         }
     }
