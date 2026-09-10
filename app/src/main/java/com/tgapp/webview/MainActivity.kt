@@ -227,7 +227,13 @@ class MainActivity : AppCompatActivity() {
 
             when (status) {
                 DownloadManager.STATUS_SUCCESSFUL -> {
-                    Toast.makeText(this, "Saved: $title", Toast.LENGTH_SHORT).show()
+                    val sizeBytes = it.getLong(it.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE))
+                    val localUri = it.getString(it.getColumnIndexOrThrow(DownloadManager.COLUMN_LOCAL_URI))
+                    Toast.makeText(
+                        this,
+                        "Saved: $title (${sizeBytes} bytes)\n$localUri",
+                        Toast.LENGTH_LONG
+                    ).show()
                 }
                 DownloadManager.STATUS_FAILED -> {
                     val reasonText = when (reason) {
