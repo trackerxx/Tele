@@ -46,6 +46,14 @@ class MainActivity : AppCompatActivity() {
     // Holds the WebView's callback while the system file picker is open (for uploads)
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
 
+    // Tracks in-flight DownloadManager requests (url/fileName/mimeType) so that if one
+    // fails or gets stuck, we can retry it through the page's own authenticated fetch()
+    // instead — that one follows redirects and sends cookies correctly, which fixes the
+    // most common cause of "HTTP data error" / stuck-paused downloads: DownloadManager
+    // silently drops our custom Cookie/Referer headers whenever the CDN URL redirects.
+    private data class PendingDownload(val url: String, val fileName: String, val mimeType: String)
+    private val pendingDownloads = mutableMapOf<Long, PendingDownload>()
+
     private val fileChooserLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -203,6 +211,10 @@ class MainActivity : AppCompatActivity() {
                     setMimeType(mimeType)
                     setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
                     setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+                    // Without these, DownloadManager can sit "paused, queued for wifi"
+                    // indefinitely on a mobile-data connection.
+                    setAllowedOverMetered(true)
+                    setAllowedOverRoaming(true)
                 }
 
                 val id = getSystemService<DownloadManager>()?.enqueue(request)
@@ -213,6 +225,7 @@ class MainActivity : AppCompatActivity() {
                 // status directly after a delay so we get the diagnostic dialog
                 // regardless.
                 if (id != null) {
+                    pendingDownloads[id] = PendingDownload(url, fileName, mimeType)
                     Handler(Looper.getMainLooper()).postDelayed({
                         reportDownloadOutcome(id)
                     }, 8000)
@@ -275,7 +288,7 @@ class MainActivity : AppCompatActivity() {
      * shows the real reason (HTTP status code, or the internal ERROR_* reason) instead
      * of leaving it as an unexplained "Untitled" notification that vanishes.
      */
-    private fun reportDownloadOutcome(downloadId: Long) {
+    private fun reportDownloadOutcome(downloadId: Long, attempt: Int = 1) {
         val dm = getSystemService<DownloadManager>() ?: return
         val cursor: Cursor = dm.query(DownloadManager.Query().setFilterById(downloadId)) ?: return
         cursor.use {
@@ -283,9 +296,11 @@ class MainActivity : AppCompatActivity() {
             val status = it.getInt(it.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
             val reason = it.getInt(it.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON))
             val title = it.getString(it.getColumnIndexOrThrow(DownloadManager.COLUMN_TITLE)) ?: "file"
+            val bytesSoFar = it.getLong(it.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR))
 
             when (status) {
                 DownloadManager.STATUS_SUCCESSFUL -> {
+                    pendingDownloads.remove(downloadId)
                     val sizeBytes = it.getLong(it.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES))
                     val localUri = it.getString(it.getColumnIndexOrThrow(DownloadManager.COLUMN_LOCAL_URI))
                     runOnUiThread {
@@ -296,38 +311,63 @@ class MainActivity : AppCompatActivity() {
                             .show()
                     }
                 }
-                DownloadManager.STATUS_FAILED -> {
-                    val reasonText = when (reason) {
-                        DownloadManager.ERROR_HTTP_DATA_ERROR -> "HTTP data error"
-                        DownloadManager.ERROR_UNHANDLED_HTTP_CODE -> "HTTP error"
-                        DownloadManager.ERROR_CANNOT_RESUME -> "cannot resume"
-                        DownloadManager.ERROR_DEVICE_NOT_FOUND -> "storage not found"
-                        DownloadManager.ERROR_FILE_ALREADY_EXISTS -> "file already exists"
-                        DownloadManager.ERROR_FILE_ERROR -> "file error"
-                        DownloadManager.ERROR_INSUFFICIENT_SPACE -> "insufficient space"
-                        DownloadManager.ERROR_TOO_MANY_REDIRECTS -> "too many redirects"
-                        else -> "code $reason (often an HTTP status like 403/404 in the 400+ range)"
-                    }
-                    runOnUiThread {
-                        AlertDialog.Builder(this)
-                            .setTitle("Download failed")
-                            .setMessage("File: $title\nReason: $reasonText")
-                            .setPositiveButton("OK", null)
-                            .show()
+                DownloadManager.STATUS_FAILED, DownloadManager.STATUS_PAUSED -> {
+                    // Both usually mean DownloadManager dropped our Cookie/Referer
+                    // headers on a redirect (Telegram's CDN commonly redirects file
+                    // URLs), not that the file is genuinely unavailable. Retry once
+                    // through the page's own fetch() — same mechanism already used for
+                    // blob: downloads — which carries the session and follows redirects
+                    // correctly on its own.
+                    val pending = pendingDownloads.remove(downloadId)
+                    if (pending != null && attempt == 1) {
+                        dm.remove(downloadId)
+                        runOnUiThread {
+                            Toast.makeText(this, "Retrying \"$title\" through Telegram session...", Toast.LENGTH_SHORT).show()
+                        }
+                        fetchAndSaveViaJs(pending.url, pending.fileName, pending.mimeType)
+                    } else {
+                        val reasonText = if (status == DownloadManager.STATUS_FAILED) {
+                            when (reason) {
+                                DownloadManager.ERROR_HTTP_DATA_ERROR -> "HTTP data error"
+                                DownloadManager.ERROR_UNHANDLED_HTTP_CODE -> "HTTP error"
+                                DownloadManager.ERROR_CANNOT_RESUME -> "cannot resume"
+                                DownloadManager.ERROR_DEVICE_NOT_FOUND -> "storage not found"
+                                DownloadManager.ERROR_FILE_ALREADY_EXISTS -> "file already exists"
+                                DownloadManager.ERROR_FILE_ERROR -> "file error"
+                                DownloadManager.ERROR_INSUFFICIENT_SPACE -> "insufficient space"
+                                DownloadManager.ERROR_TOO_MANY_REDIRECTS -> "too many redirects"
+                                else -> "code $reason (often an HTTP status like 403/404 in the 400+ range)"
+                            }
+                        } else {
+                            "still paused after retry"
+                        }
+                        runOnUiThread {
+                            AlertDialog.Builder(this)
+                                .setTitle("Download failed")
+                                .setMessage("File: $title\nReason: $reasonText")
+                                .setPositiveButton("OK", null)
+                                .show()
+                        }
                     }
                 }
-                DownloadManager.STATUS_RUNNING, DownloadManager.STATUS_PENDING, DownloadManager.STATUS_PAUSED -> {
-                    val statusText = when (status) {
-                        DownloadManager.STATUS_RUNNING -> "still running"
-                        DownloadManager.STATUS_PENDING -> "still pending (not started yet)"
-                        else -> "paused"
-                    }
-                    runOnUiThread {
-                        AlertDialog.Builder(this)
-                            .setTitle("Download stuck")
-                            .setMessage("File: $title\nStatus: $statusText (8s after starting)")
-                            .setPositiveButton("OK", null)
-                            .show()
+                DownloadManager.STATUS_RUNNING, DownloadManager.STATUS_PENDING -> {
+                    // Large videos genuinely take longer than 8s — don't alarm the user
+                    // about a download that's still actively progressing. Re-check a few
+                    // more times (up to ~32s total) before calling it stuck.
+                    if (attempt < 4) {
+                        Handler(Looper.getMainLooper()).postDelayed({
+                            reportDownloadOutcome(downloadId, attempt + 1)
+                        }, 8000)
+                    } else {
+                        val statusText = if (status == DownloadManager.STATUS_RUNNING)
+                            "still running" else "still pending (not started yet)"
+                        runOnUiThread {
+                            AlertDialog.Builder(this)
+                                .setTitle("Download stuck")
+                                .setMessage("File: $title\nStatus: $statusText\nDownloaded so far: $bytesSoFar bytes")
+                                .setPositiveButton("OK", null)
+                                .show()
+                        }
                     }
                 }
             }
