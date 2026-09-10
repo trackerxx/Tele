@@ -2,6 +2,7 @@ package com.tgapp.webview
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.DownloadManager
 import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -26,6 +27,7 @@ import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.getSystemService
 import androidx.core.view.WindowCompat
 import java.io.File
 import java.io.FileOutputStream
@@ -137,17 +139,46 @@ class MainActivity : AppCompatActivity() {
 
         // Handles files that Telegram Web pushes out for download (media, documents, etc.)
         //
-        // Note: DownloadManager fetching these URLs itself (in a separate process, with
-        // just a copied cookie header) does NOT work reliably here — web.telegram.org/k/
-        // serves downloads through its own service worker / in-page session, so an
-        // external fetch to the "same" URL can hang forever (stuck "downloading", file
-        // never finishes, never shows up anywhere). Instead we always fetch the bytes
-        // from *inside* the page via JS (same cookies, same service worker) and hand them
-        // to Android as base64 to write straight to the Downloads folder.
-        webView.setDownloadListener { url, _, contentDisposition, mimeType, _ ->
+        // Two different mechanisms are needed depending on the URL scheme:
+        // - blob: URLs (in-memory objects created by the page's own JS) can't be fetched
+        //   by DownloadManager at all, since there's no real network request behind them.
+        //   For these we read the bytes from inside the page via JS and hand them to
+        //   Android as base64.
+        // - Regular http(s) URLs (usually a CDN, different domain than web.telegram.org)
+        //   are handled by DownloadManager directly. We do NOT use JS fetch() for these,
+        //   because that hits the browser's CORS policy on cross-origin resources and
+        //   fails with "Failed to fetch". DownloadManager is a native HTTP client, not a
+        //   browser context, so CORS doesn't apply — but it needs the same Referer/
+        //   User-Agent/cookie headers a real in-page request would send, since CDNs with
+        //   hotlink protection silently drop requests missing them (this is what caused
+        //   downloads to sit at "downloading" forever with no file ever appearing).
+        webView.setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
             val fileName = URLUtil.guessFileName(url, contentDisposition, mimeType)
-            fetchAndSaveViaJs(url, fileName, mimeType)
-            Toast.makeText(this, "Preparing download: $fileName", Toast.LENGTH_SHORT).show()
+
+            if (url.startsWith("blob:")) {
+                fetchAndSaveViaJs(url, fileName, mimeType)
+                Toast.makeText(this, "Preparing download: $fileName", Toast.LENGTH_SHORT).show()
+                return@setDownloadListener
+            }
+
+            try {
+                val cookie = CookieManager.getInstance().getCookie(url) ?: ""
+                val referer = webView.url ?: "https://web.telegram.org/k/"
+
+                val request = DownloadManager.Request(Uri.parse(url)).apply {
+                    addRequestHeader("cookie", cookie)
+                    addRequestHeader("User-Agent", userAgent)
+                    addRequestHeader("Referer", referer)
+                    setMimeType(mimeType)
+                    setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                    setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+                }
+
+                getSystemService<DownloadManager>()?.enqueue(request)
+                Toast.makeText(this, "Downloading $fileName", Toast.LENGTH_SHORT).show()
+            } catch (e: Exception) {
+                Toast.makeText(this, "Download failed: ${e.message}", Toast.LENGTH_SHORT).show()
+            }
         }
 
         if (savedInstanceState != null) {
@@ -158,11 +189,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Runs JS inside the page to fetch a URL's real bytes (using the page's own cookies
-     * and, importantly, going through its service worker like a normal in-page download
-     * would) and hands them back to Android as base64 via BlobDownloadInterface.
-     * Works for both blob: URLs and normal-looking https: URLs that only resolve
-     * correctly from inside the page's own context.
+     * Runs JS inside the page to read a blob: URL's real bytes and hands them back to
+     * Android as base64 via BlobDownloadInterface. Used only for blob: URLs, since
+     * DownloadManager has no way to fetch that scheme itself.
      */
     private fun fetchAndSaveViaJs(url: String, fileName: String, mimeType: String) {
         val safeUrl = url.replace("\\", "\\\\").replace("\"", "\\\"")
@@ -261,6 +290,9 @@ class MainActivity : AppCompatActivity() {
             }
         }
         needed += Manifest.permission.RECORD_AUDIO
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            needed += Manifest.permission.POST_NOTIFICATIONS
+        }
 
         val notGranted = needed.filter {
             checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
