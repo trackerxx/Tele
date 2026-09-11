@@ -148,7 +148,7 @@ class MainActivity : AppCompatActivity() {
         if (savedInstanceState != null) {
             webView.restoreState(savedInstanceState)
         } else {
-            webView.loadUrl("https://web.telegram.org/k/")
+            webView.loadUrl("https://web.telegram.org/a/")
         }
     }
 
