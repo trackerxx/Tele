@@ -11,7 +11,9 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.util.Base64
 import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
 import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.PermissionRequest
@@ -20,6 +22,8 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
+import java.io.File
+import java.io.FileOutputStream
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.getSystemService
@@ -53,6 +57,35 @@ class MainActivity : AppCompatActivity() {
         ActivityResultContracts.RequestMultiplePermissions()
     ) { /* if denied, the relevant action (upload/download) just won't work until retried */ }
 
+    /**
+     * DownloadManager can only fetch http/https URLs, but Telegram Web A generates
+     * blob: URLs for exports/media. This bridge lets injected JS hand the blob's
+     * base64 content straight to Kotlin so it can be written to Downloads directly.
+     */
+    private inner class BlobDownloader {
+        @JavascriptInterface
+        fun saveBase64File(base64Data: String, fileName: String) {
+            try {
+                val commaIndex = base64Data.indexOf(",")
+                val pureBase64 = if (commaIndex != -1) base64Data.substring(commaIndex + 1) else base64Data
+                val bytes = Base64.decode(pureBase64, Base64.DEFAULT)
+
+                val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                val outFile = File(downloadsDir, fileName)
+
+                FileOutputStream(outFile).use { it.write(bytes) }
+
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "Downloaded $fileName", Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "Download failed: ${e.message}", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -84,6 +117,7 @@ class MainActivity : AppCompatActivity() {
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
 
         webView.webViewClient = WebViewClient()
+        webView.addJavascriptInterface(BlobDownloader(), "AndroidDownloader")
 
         // Lets the "attach file" button inside web.telegram.org open the system file picker
         webView.webChromeClient = object : WebChromeClient() {
@@ -127,8 +161,30 @@ class MainActivity : AppCompatActivity() {
 
         // Handles files that Telegram Web pushes out for download (media, documents, etc.)
         webView.setDownloadListener { url, _, contentDisposition, mimeType, _ ->
+            val fileName = URLUtil.guessFileName(url, contentDisposition, mimeType)
+
+            if (url.startsWith("blob:")) {
+                // DownloadManager can't fetch blob: URLs itself — pull the bytes out via JS instead.
+                val js = """
+                    (function() {
+                        var xhr = new XMLHttpRequest();
+                        xhr.open('GET', '$url', true);
+                        xhr.responseType = 'blob';
+                        xhr.onload = function() {
+                            var reader = new FileReader();
+                            reader.onloadend = function() {
+                                AndroidDownloader.saveBase64File(reader.result, '$fileName');
+                            };
+                            reader.readAsDataURL(xhr.response);
+                        };
+                        xhr.send();
+                    })();
+                """.trimIndent()
+                webView.evaluateJavascript(js, null)
+                return@setDownloadListener
+            }
+
             try {
-                val fileName = URLUtil.guessFileName(url, contentDisposition, mimeType)
                 val cookie = CookieManager.getInstance().getCookie(url) ?: ""
 
                 val request = DownloadManager.Request(Uri.parse(url)).apply {
